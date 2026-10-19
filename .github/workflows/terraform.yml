@@ -1,0 +1,182 @@
+# PR: 검사(dev·prod 전체) + 바뀐 Dev stack plan  →  main 병합: Dev 자동 apply → Prod plan 저장 → 승인 → 저장된 plan apply
+# 수동 실행: Dev stack 하나를 삭제(destroy)하거나 다시 만든다(apply).
+name: terraform
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      working_directory:
+        description: "Dev stack 경로 (예: terraform/environments/dev/compute/eks)"
+        type: string
+        required: true
+      action:
+        description: "apply = 다시 만들기, destroy = 삭제"
+        type: choice
+        options: [apply, destroy]
+
+# 기본은 읽기만. OIDC 토큰(id-token)과 PR 코멘트 권한은 쓰는 job에서만 연다.
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      pr: ${{ steps.find.outputs.pr }}
+      pr_plan: ${{ steps.find.outputs.pr_plan }}
+      dev: ${{ steps.find.outputs.dev }}
+      prod: ${{ steps.find.outputs.prod }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # 바뀐 파일에서 가장 가까운 backend.tf 디렉터리를 stack으로 본다.
+      # modules/ 가 바뀌면 모든 stack을 대상으로 한다. CI 대상은 dev·prod stack뿐이고 bootstrap은 관리자가 직접 적용한다.
+      - id: find
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          all_stacks() {
+            find terraform/environments -name backend.tf -printf '%h\n'
+          }
+          changed=$(git diff --name-only "$BASE" "$GITHUB_SHA" -- terraform)
+          if grep -q '^terraform/modules/' <<< "$changed"; then
+            stacks=$(all_stacks)
+          else
+            stacks=$(for f in $changed; do
+              d=$(dirname "$f")
+              while [[ "$d" == terraform/environments/* ]]; do
+                if [[ -f "$d/backend.tf" ]]; then echo "$d"; break; fi
+                d=$(dirname "$d")
+              done
+            done)
+          fi
+          stacks=$(sort -u <<< "$stacks" | grep -E '^terraform/environments/(dev|prod)/' | grep -v '/bootstrap$' || true)
+
+          to_json() { jq -Rn '[inputs | select(length > 0)]'; }
+          dev=$(grep '^terraform/environments/dev/' <<< "$stacks" | to_json | jq -c .)
+          echo "dev=$dev" >> "$GITHUB_OUTPUT"
+          # PR plan은 Dev stack만 돈다. Prod plan은 main 병합 뒤 prod-plan에서만 만든다.
+          echo "pr_plan=$dev" >> "$GITHUB_OUTPUT"
+          echo "prod=$(grep '^terraform/environments/prod/' <<< "$stacks" | to_json | jq -c .)" >> "$GITHUB_OUTPUT"
+          echo "pr=$(to_json <<< "$stacks" | jq -c 'map({dir: ., env: (split("/")[2])})')" >> "$GITHUB_OUTPUT"
+
+  validate:
+    if: github.event_name == 'pull_request'
+    needs: changes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.16.0
+          terraform_wrapper: false
+      - uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
+        with:
+          tflint_version: v0.64.0
+      - run: terraform fmt -check -recursive terraform
+      - env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          tflint --init --config "$PWD/.tflint.hcl"
+          tflint --recursive --config "$PWD/.tflint.hcl"
+      - name: validate changed stacks
+        env:
+          STACKS: ${{ needs.changes.outputs.pr }}
+        run: |
+          for d in $(jq -r '.[].dir' <<< "$STACKS"); do
+            terraform -chdir="$d" init -backend=false
+            terraform -chdir="$d" validate
+          done
+      - name: module tests
+        run: |
+          for d in terraform/modules/*/; do
+            if [ -d "$d/tests" ]; then
+              terraform -chdir="$d" init -backend=false
+              terraform -chdir="$d" test
+            fi
+          done          
+
+  plan:
+    needs: [changes, validate]
+    if: github.event_name == 'pull_request' && needs.changes.outputs.pr_plan != '[]'
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: ${{ fromJSON(needs.changes.outputs.pr_plan) }}
+    uses: ./.github/workflows/terraform-stack.yml
+    with:
+      working_directory: ${{ matrix.dir }}
+      github_environment: dev-plan
+      mode: plan
+
+  # 필수 검사용 고정 이름 job. plan job 이름은 stack 경로가 붙어 PR마다 달라서 결과를 여기서 모은다.
+  plan-result:
+    if: always() && github.event_name == 'pull_request'
+    needs: [changes, validate, plan]
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          CHANGES: ${{ needs.changes.result }}
+          VALIDATE: ${{ needs.validate.result }}
+          PLAN: ${{ needs.plan.result }}
+          TARGETS: ${{ needs.changes.outputs.pr_plan }}
+        run: |
+          echo "changes=$CHANGES validate=$VALIDATE plan=$PLAN targets=$TARGETS"
+          [ "$CHANGES" = success ] && [ "$VALIDATE" = success ] || exit 1
+          [ "$PLAN" = success ] && exit 0
+          # skipped는 대상 Dev stack이 없을 때만 통과한다.
+          [ "$PLAN" = skipped ] && [ "$TARGETS" = "[]" ]
+    apply-dev:
+    needs: changes
+    if: github.event_name == 'push' && needs.changes.outputs.dev != '[]'
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: ${{ fromJSON(needs.changes.outputs.dev) }}
+    uses: ./.github/workflows/terraform-stack.yml
+    with:
+      working_directory: ${{ matrix.dir }}
+      github_environment: dev
+      mode: apply
+
+  # stack마다 save-plan(prod-plan) → 승인 → apply-saved(prod)가 한 호출 안에서 이어진다.
+  # 그래야 저장한 plan의 key·VersionId가 job output으로 그 stack의 apply에만 넘어간다.
+  prod:
+    needs: [changes, apply-dev]
+    if: ${{ !failure() && !cancelled() && github.event_name == 'push' && needs.changes.outputs.prod != '[]' }}
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: ${{ fromJSON(needs.changes.outputs.prod) }}
+    uses: ./.github/workflows/terraform-stack.yml
+    with:
+      working_directory: ${{ matrix.dir }}
+      github_environment: prod-plan
+      mode: save-plan
+
+  dispatch-dev:
+    if: github.event_name == 'workflow_dispatch' && startsWith(inputs.working_directory, 'terraform/environments/dev/') && !endsWith(inputs.working_directory, '/bootstrap')
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/terraform-stack.yml
+    with:
+      working_directory: ${{ inputs.working_directory }}
+      github_environment: dev
+      mode: ${{ inputs.action }}

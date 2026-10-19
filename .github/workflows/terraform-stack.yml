@@ -1,0 +1,160 @@
+# stack 하나에 대해 plan / apply / destroy / Prod용 plan 저장 → 승인 → 저장된 plan 적용을 실행하는 재사용 workflow.
+# 권한(permissions)은 호출하는 job이 정한다.
+name: terraform-stack
+
+on:
+  workflow_call:
+    inputs:
+      working_directory:
+        description: "stack 경로 (예: terraform/environments/dev/network/vpc)"
+        type: string
+        required: true
+      github_environment:
+        description: "역할과 변수를 가져올 GitHub Environment (dev-plan, dev, prod-plan)"
+        type: string
+        required: true
+      mode:
+        description: "plan | apply | destroy | save-plan (save-plan은 prod 승인 뒤 apply-saved까지 이어진다)"
+        type: string
+        required: true
+jobs:
+  terraform:
+    name: ${{ inputs.mode }} ${{ inputs.working_directory }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.github_environment }}
+    # 같은 stack의 실행은 한 줄로 기다린다. queue: max는 대기 중인 apply를 취소하지 않고 보존한다.
+    concurrency:
+      group: tfstate-${{ inputs.working_directory }}
+      queue: max
+    outputs:
+      plan_key: ${{ steps.save.outputs.plan_key }}
+      plan_version_id: ${{ steps.save.outputs.plan_version_id }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    env:
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+      TF_VAR_account_id: ${{ vars.AWS_ACCOUNT_ID }}
+      TF_VAR_permissions_boundary_arn: ${{ vars.PERMISSIONS_BOUNDARY_ARN }}
+      TF_VAR_state_bucket: ${{ vars.TF_STATE_BUCKET }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      STACK: ${{ inputs.working_directory }}
+      MODE: ${{ inputs.mode }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.16.0
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}      
+
+      - name: init
+        run: terraform init -backend-config="bucket=${TF_STATE_BUCKET}"
+
+      # public 저장소이므로 plan 전체 출력은 로그에 남기지 않고 파일로만 받는다.
+      - name: plan
+        run: |
+          if [ "$MODE" = "destroy" ]; then DESTROY="-destroy"; else DESTROY=""; fi
+          terraform plan $DESTROY -lock-timeout=5m -out=tfplan > plan.log
+
+      - name: summary
+        run: |
+          {
+            echo "### $STACK"
+            echo '```'
+            terraform show -json tfplan | jq -r '
+              [.resource_changes[]? | select(.change.actions != ["no-op"])] as $c
+              | ($c[] | "\(.change.actions | join("/"))  \(.address)"),
+                "",
+                "create \([$c[] | select(.change.actions | index("create"))] | length), update \([$c[] | select(.change.actions == ["update"])] | length), delete \([$c[] | select(.change.actions | index("delete"))] | length)"'
+            echo '```'
+          } > summary.md
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: comment on PR
+        if: inputs.mode == 'plan' && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr comment "${{ github.event.pull_request.number }}" --repo "${{ github.repository }}" --body-file summary.md
+
+      - name: apply
+        if: inputs.mode == 'apply' || inputs.mode == 'destroy'
+        run: terraform apply tfplan
+
+      # 실행마다 다른 key에 올리고, 올린 객체의 VersionId를 output으로 넘긴다.
+      # 승인 뒤 apply-saved는 이 실행이 넘긴 key·VersionId의 객체만 내려받는다.
+      - name: save plan
+        id: save
+        if: inputs.mode == 'save-plan'
+        env:
+          PLAN_KEY: plans/${{ inputs.working_directory }}/${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}.tfplan
+        run: |
+          version_id=$(aws s3api put-object --bucket "$TF_STATE_BUCKET" --key "$PLAN_KEY" --body tfplan --query VersionId --output text)
+          echo "plan_key=$PLAN_KEY" >> "$GITHUB_OUTPUT"
+          echo "plan_version_id=$version_id" >> "$GITHUB_OUTPUT"
+          {
+            echo "- stack: $STACK"
+            echo "- commit: $GITHUB_SHA"
+            echo "- run_id: $GITHUB_RUN_ID, run_attempt: $GITHUB_RUN_ATTEMPT"
+            echo "- key: $PLAN_KEY"
+            echo "- VersionId: $version_id"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  apply-saved:
+    name: apply-saved ${{ inputs.working_directory }}
+    needs: terraform
+    if: inputs.mode == 'save-plan'
+    runs-on: ubuntu-latest
+    # 필수 리뷰어가 승인해야 시작하고, 그때 gha-prod-apply 역할을 받는다.
+    environment: prod
+    concurrency:
+      group: tfstate-${{ inputs.working_directory }}
+      queue: max
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    env:
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+      TF_VAR_account_id: ${{ vars.AWS_ACCOUNT_ID }}
+      TF_VAR_permissions_boundary_arn: ${{ vars.PERMISSIONS_BOUNDARY_ARN }}
+      TF_VAR_state_bucket: ${{ vars.TF_STATE_BUCKET }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      STACK: ${{ inputs.working_directory }}
+      PLAN_KEY: ${{ needs.terraform.outputs.plan_key }}
+      PLAN_VERSION_ID: ${{ needs.terraform.outputs.plan_version_id }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.16.0
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: init
+        run: terraform init -backend-config="bucket=${TF_STATE_BUCKET}"
+
+      - name: apply saved plan
+        run: |
+          aws s3api get-object --bucket "$TF_STATE_BUCKET" --key "$PLAN_KEY" --version-id "$PLAN_VERSION_ID" tfplan > /dev/null
+          terraform apply tfplan
+          {
+            echo "### applied $STACK"
+            echo "- commit: $GITHUB_SHA"
+            echo "- run_id: $GITHUB_RUN_ID, run_attempt: $GITHUB_RUN_ATTEMPT"
+            echo "- key: $PLAN_KEY"
+            echo "- VersionId: $PLAN_VERSION_ID"
+          } >> "$GITHUB_STEP_SUMMARY"
