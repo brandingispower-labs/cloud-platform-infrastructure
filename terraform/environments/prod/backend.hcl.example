@@ -1,0 +1,3 @@
+# 복사해 backend.hcl(커밋하지 않음)을 만들고, <Prod 계정 ID>를 내 Prod 계정 ID로 바꾼다.
+# ex) cloud-platform-prod-tfstate-222222222222
+bucket = "cloud-platform-prod-tfstate-<Prod 계정 ID>"
