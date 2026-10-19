@@ -1,0 +1,21 @@
+name: oidc-claims
+on: pull_request
+jobs:
+  claims:
+    runs-on: ubuntu-latest
+    environment: dev-plan
+    permissions:
+      id-token: write
+    env:
+      ACCOUNT: ${{ vars.AWS_ACCOUNT_ID }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+    steps:
+      - run: |
+          T=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
+          echo "::add-mask::$T"
+          P=$(cut -d. -f2 <<< "$T" | tr '_-' '/+'); while (( ${#P} % 4 )); do P="$P="; done
+          base64 -d <<< "$P" | jq -c '{aud, sub}'
+          for r in gha-dev-plan gha-dev-apply; do
+            aws sts assume-role-with-web-identity --role-arn "arn:aws:iam::$ACCOUNT:role/$r" --role-session-name oidc-check \
+              --web-identity-token "$T" --query AssumedRoleUser.Arn --output text || echo "denied $r"
+          done
