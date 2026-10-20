@@ -7,7 +7,7 @@ resource "aws_s3_bucket" "logs" {
   bucket = local.bucket_name
 
   lifecycle {
-    prevent_destroy = false
+    prevent_destroy = true
   }
 }
 
