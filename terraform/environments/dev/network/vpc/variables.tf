@@ -29,3 +29,8 @@ variable "single_nat_gateway" {
   description = "true면 NAT Gateway 1개를 모든 AZ가 같이 쓴다(Dev 비용 절감)."
   type        = bool
 }
+
+variable "state_bucket" {
+  description = "다른 stack의 State를 읽을 버킷. CI는 TF_VAR_state_bucket으로 넣는다."
+  type        = string
+}
