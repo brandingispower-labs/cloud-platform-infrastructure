@@ -27,3 +27,8 @@ output "intra_subnet_ids" {
 output "private_route_table_ids" {
   value = module.vpc.private_route_table_ids
 }
+
+output "eks_subnet_ids" {
+  description = "EKS 노드와 Pod 전용 서브넷. AZ 순서와 같다."
+  value       = [for az in var.azs : aws_subnet.eks[az].id]
+}
