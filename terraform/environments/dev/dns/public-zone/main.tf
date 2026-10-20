@@ -4,6 +4,6 @@ resource "aws_route53_zone" "public" {
   comment = "${var.environment} public zone"
 
   lifecycle {
-    prevent_destroy = false
+    prevent_destroy = true
   }
 }
