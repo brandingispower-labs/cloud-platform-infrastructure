@@ -29,10 +29,10 @@ resource "aws_route" "app_to_shared" {
 }
 
 # shared -> app 으로 돌아오는 길
-# resource "aws_route" "shared_to_app" {
-#   route_table_id         = aws_route_table.private["shared"].id
-#   destination_cidr_block = var.vpc_cidrs["app"]
-#   transit_gateway_id     = aws_ec2_transit_gateway.lab.id
+resource "aws_route" "shared_to_app" {
+  route_table_id         = aws_route_table.private["shared"].id
+  destination_cidr_block = var.vpc_cidrs["app"]
+  transit_gateway_id     = aws_ec2_transit_gateway.lab.id
 
-#   depends_on = [aws_ec2_transit_gateway_vpc_attachment.lab]
-# }
+  depends_on = [aws_ec2_transit_gateway_vpc_attachment.lab]
+}
